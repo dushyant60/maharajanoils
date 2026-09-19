@@ -33,91 +33,107 @@ export default function HeroSequence({ scrollContainerRef }) {
   // Map smooth progress (0-1) to frame index (1-100)
   const frameIndex = useTransform(smoothProgress, [0, 1], [1, TOTAL_FRAMES]);
 
-  const canvasSize = useRef({ width: 0, height: 0 });
-  const initialized = useRef(false);
-
-  // Initialize canvas size (run once or on resize)
-  const initCanvas = () => {
-    if (!canvasRef.current) return;
-    const rect = canvasRef.current.getBoundingClientRect();
-    canvasSize.current = { width: rect.width, height: rect.height };
-    
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    canvasRef.current.width = rect.width * dpr;
-    canvasRef.current.height = rect.height * dpr;
-    
-    const ctx = canvasRef.current.getContext("2d");
-    // Reset transform before scaling to prevent compounding scales on resize
-    ctx.setTransform(1, 0, 0, 1, 0, 0); 
-    ctx.scale(dpr, dpr);
-    initialized.current = true;
-  };
-
-  // Canvas drawing logic
-  const drawFrame = (index) => {
-    if (!initialized.current) initCanvas();
-    
-    const canvas = canvasRef.current;
-    if (!canvas || !imagesRef.current[index - 1]) return;
-
-    const ctx = canvas.getContext("2d", { alpha: false }); 
-    const image = imagesRef.current[index - 1];
-
-    // If image isn't downloaded yet, just skip drawing so the previous frame stays visible
-    if (!image.complete || image.naturalWidth === 0) return;
-
-    const { width: rectWidth, height: rectHeight } = canvasSize.current;
-    if (rectWidth === 0 || rectHeight === 0) return;
-    
-    const scale = Math.max(rectWidth / image.width, rectHeight / image.height);
-    const x = (rectWidth / 2) - (image.width / 2) * scale;
-    const y = (rectHeight / 2) - (image.height / 2) * scale;
-    
-    ctx.drawImage(image, x, y, image.width * scale, image.height * scale);
-  };
-
-  // Preload images progressively
+  // Preload images
   useEffect(() => {
+    let loadedCount = 0;
     const images = [];
-    imagesRef.current = images; // Assign immediately so drawFrame can access them
 
     for (let i = 1; i <= TOTAL_FRAMES; i++) {
       const img = new window.Image();
       img.src = getFramePath(i);
-      
       img.onload = () => {
-        // As soon as the first frame loads, draw it immediately so the user isn't staring at a blank screen!
-        if (i === 1) {
-          drawFrame(1);
-          setImagesLoaded(true); // Signal that at least the first frame is ready
-        }
-        // If the user happens to be scrolling while loading, try to draw the current frame when it arrives
-        if (i === currentFrame.current) {
-           requestAnimationFrame(() => drawFrame(i));
+        loadedCount++;
+        if (loadedCount === TOTAL_FRAMES) {
+          imagesRef.current = images;
+          setImagesLoaded(true);
         }
       };
-      
+      // For images that might fail or are already cached
+      img.onerror = () => {
+        loadedCount++;
+        if (loadedCount === TOTAL_FRAMES) {
+          imagesRef.current = images;
+          setImagesLoaded(true);
+        }
+      };
       images.push(img);
     }
-    
-    // Fallback resize listener
-    const handleResize = () => {
-      initCanvas();
-      requestAnimationFrame(() => drawFrame(currentFrame.current));
-    };
-    
-    window.addEventListener("resize", handleResize);
-    return () => window.removeEventListener("resize", handleResize);
   }, []);
+
+  const canvasSize = useRef({ width: 0, height: 0 });
+
+  // Canvas drawing logic
+  const drawFrame = (index) => {
+    const canvas = canvasRef.current;
+    if (!canvas || !imagesRef.current[index - 1]) return;
+
+    const ctx = canvas.getContext("2d", { alpha: false }); // alpha false is an optimization
+    const image = imagesRef.current[index - 1];
+
+    if (!image.complete || image.naturalWidth === 0) return;
+
+    const { width: rectWidth, height: rectHeight } = canvasSize.current;
+    if (rectWidth === 0 || rectHeight === 0) return;
+
+    // We don't need clearRect if the image covers the entire canvas (optimization)
+    // Maintain aspect ratio while covering the entire canvas
+    const scale = Math.max(rectWidth / image.width, rectHeight / image.height);
+    const x = (rectWidth / 2) - (image.width / 2) * scale;
+    const y = (rectHeight / 2) - (image.height / 2) * scale;
+
+    ctx.drawImage(image, x, y, image.width * scale, image.height * scale);
+  };
+
+  // Draw initial frame once loaded
+  useEffect(() => {
+    if (imagesLoaded && canvasRef.current) {
+      const rect = canvasRef.current.getBoundingClientRect();
+      canvasSize.current = { width: rect.width, height: rect.height };
+
+      const dpr = Math.min(window.devicePixelRatio || 1, 2); // Cap at 2x to save GPU
+      canvasRef.current.width = rect.width * dpr;
+      canvasRef.current.height = rect.height * dpr;
+
+      const ctx = canvasRef.current.getContext("2d");
+      ctx.scale(dpr, dpr);
+
+      drawFrame(1);
+    }
+  }, [imagesLoaded]);
 
   // Handle scroll events
   useMotionValueEvent(frameIndex, "change", (latest) => {
+    if (!imagesLoaded) return;
+
     const index = Math.round(latest);
     if (index !== currentFrame.current && index >= 1 && index <= TOTAL_FRAMES) {
       currentFrame.current = index;
       requestAnimationFrame(() => drawFrame(index));
     }
   });
+
+  // Handle resize events to redraw
+  useEffect(() => {
+    const handleResize = () => {
+      if (canvasRef.current) {
+        const rect = canvasRef.current.getBoundingClientRect();
+        canvasSize.current = { width: rect.width, height: rect.height };
+
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        canvasRef.current.width = rect.width * dpr;
+        canvasRef.current.height = rect.height * dpr;
+
+        const ctx = canvasRef.current.getContext("2d");
+        ctx.scale(dpr, dpr);
+
+        if (imagesLoaded) {
+          requestAnimationFrame(() => drawFrame(currentFrame.current));
+        }
+      }
+    };
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, [imagesLoaded]);
 
   return (
     <canvas
