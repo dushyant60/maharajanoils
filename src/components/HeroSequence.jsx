@@ -1,110 +1,129 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { useScroll, useTransform, useMotionValueEvent, useSpring } from "framer-motion";
 
 const TOTAL_FRAMES = 100;
+const EAGER_COUNT = 12; // frames loaded before we paint anything
+const BATCH_SIZE = 6;   // frames loaded per batch after that
 
+// Same naming pattern as before, just .avif instead of .jpg,
+// and pointing at the new /seq folder produced by convert.py
 const getFramePath = (index) => {
-  // Map index 1-100 to file names 000-099
   const paddedIndex = (index - 1).toString().padStart(3, "0");
-  return `/oil_image_sequence/A_high_end_commercial_video_s_${paddedIndex}.jpg`;
+  return `/seq/A_high_end_commercial_video_s_${paddedIndex}.avif`;
 };
+
+const loadImage = (src) =>
+  new Promise((resolve) => {
+    const img = new window.Image();
+    img.decoding = "async";
+    img.onload = () => resolve(img);
+    img.onerror = () => resolve(null); // don't let one bad frame block the batch
+    img.src = src;
+  });
 
 export default function HeroSequence({ scrollContainerRef }) {
   const canvasRef = useRef(null);
-  const imagesRef = useRef([]);
-  const [imagesLoaded, setImagesLoaded] = useState(false);
+  const ctxRef = useRef(null);
+  const imagesRef = useRef(new Array(TOTAL_FRAMES).fill(null));
+  const canvasSize = useRef({ width: 0, height: 0 });
   const currentFrame = useRef(1);
+  const [ready, setReady] = useState(false);
 
-  // Scroll mapping
   const { scrollYProgress } = useScroll({
     target: scrollContainerRef,
-    offset: ["start start", "end end"]
+    offset: ["start start", "end end"],
   });
 
-  // Apply spring physics for smooth, buttery scroll interpolation
   const smoothProgress = useSpring(scrollYProgress, {
     stiffness: 100,
     damping: 30,
-    restDelta: 0.001
+    restDelta: 0.001,
   });
 
-  // Map smooth progress (0-1) to frame index (1-100)
   const frameIndex = useTransform(smoothProgress, [0, 1], [1, TOTAL_FRAMES]);
 
-  // Preload images
-  useEffect(() => {
-    let loadedCount = 0;
-    const images = [];
+  // Draw the requested frame, or the nearest loaded one if it isn't ready yet
+  const drawFrame = useCallback((index) => {
+    const ctx = ctxRef.current;
+    if (!ctx) return;
 
-    for (let i = 1; i <= TOTAL_FRAMES; i++) {
-      const img = new window.Image();
-      img.src = getFramePath(i);
-      img.onload = () => {
-        loadedCount++;
-        if (loadedCount === TOTAL_FRAMES) {
-          imagesRef.current = images;
-          setImagesLoaded(true);
-        }
-      };
-      // For images that might fail or are already cached
-      img.onerror = () => {
-        loadedCount++;
-        if (loadedCount === TOTAL_FRAMES) {
-          imagesRef.current = images;
-          setImagesLoaded(true);
-        }
-      };
-      images.push(img);
+    let img = null;
+    for (let d = 0; d < TOTAL_FRAMES; d++) {
+      const back = imagesRef.current[index - 1 - d];
+      if (back) { img = back; break; }
+      const fwd = imagesRef.current[index - 1 + d];
+      if (fwd) { img = fwd; break; }
     }
+    if (!img || !img.complete || img.naturalWidth === 0) return;
+
+    const { width: w, height: h } = canvasSize.current;
+    if (!w || !h) return;
+
+    const scale = Math.max(w / img.width, h / img.height);
+    const x = w / 2 - (img.width / 2) * scale;
+    const y = h / 2 - (img.height / 2) * scale;
+    ctx.drawImage(img, x, y, img.width * scale, img.height * scale);
   }, []);
 
-  const canvasSize = useRef({ width: 0, height: 0 });
-
-  // Canvas drawing logic
-  const drawFrame = (index) => {
+  // Size the canvas for the current layout/DPR. Context is created once
+  // here (with alpha:false actually taking effect, since this is the
+  // first getContext call) and cached in ctxRef.
+  const sizeCanvas = useCallback(() => {
     const canvas = canvasRef.current;
-    if (!canvas || !imagesRef.current[index - 1]) return;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    canvasSize.current = { width: rect.width, height: rect.height };
 
-    const ctx = canvas.getContext("2d", { alpha: false }); // alpha false is an optimization
-    const image = imagesRef.current[index - 1];
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
 
-    if (!image.complete || image.naturalWidth === 0) return;
-
-    const { width: rectWidth, height: rectHeight } = canvasSize.current;
-    if (rectWidth === 0 || rectHeight === 0) return;
-
-    // We don't need clearRect if the image covers the entire canvas (optimization)
-    // Maintain aspect ratio while covering the entire canvas
-    const scale = Math.max(rectWidth / image.width, rectHeight / image.height);
-    const x = (rectWidth / 2) - (image.width / 2) * scale;
-    const y = (rectHeight / 2) - (image.height / 2) * scale;
-
-    ctx.drawImage(image, x, y, image.width * scale, image.height * scale);
-  };
-
-  // Draw initial frame once loaded
-  useEffect(() => {
-    if (imagesLoaded && canvasRef.current) {
-      const rect = canvasRef.current.getBoundingClientRect();
-      canvasSize.current = { width: rect.width, height: rect.height };
-
-      const dpr = Math.min(window.devicePixelRatio || 1, 2); // Cap at 2x to save GPU
-      canvasRef.current.width = rect.width * dpr;
-      canvasRef.current.height = rect.height * dpr;
-
-      const ctx = canvasRef.current.getContext("2d");
-      ctx.scale(dpr, dpr);
-
-      drawFrame(1);
+    if (!ctxRef.current) {
+      ctxRef.current = canvas.getContext("2d", { alpha: false });
     }
-  }, [imagesLoaded]);
+    // Resizing canvas.width/height resets any existing transform,
+    // so re-apply the DPR scale every time.
+    ctxRef.current.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }, []);
 
-  // Handle scroll events
+  // Progressive load: paint as soon as the first batch is in,
+  // then keep streaming the rest in the background.
+  useEffect(() => {
+    let cancelled = false;
+    sizeCanvas();
+
+    (async () => {
+      const eager = await Promise.all(
+        Array.from({ length: EAGER_COUNT }, (_, i) => loadImage(getFramePath(i + 1)))
+      );
+      if (cancelled) return;
+      eager.forEach((img, i) => { imagesRef.current[i] = img; });
+      setReady(true);
+      drawFrame(1);
+
+      for (let start = EAGER_COUNT; start < TOTAL_FRAMES; start += BATCH_SIZE) {
+        const idx = Array.from(
+          { length: Math.min(BATCH_SIZE, TOTAL_FRAMES - start) },
+          (_, k) => start + k
+        );
+        const imgs = await Promise.all(idx.map((i) => loadImage(getFramePath(i + 1))));
+        if (cancelled) return;
+        idx.forEach((i, k) => { imagesRef.current[i] = imgs[k]; });
+
+        // If the user scrolled into this batch before it finished, refresh the view
+        if (idx.includes(currentFrame.current - 1)) {
+          drawFrame(currentFrame.current);
+        }
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [drawFrame, sizeCanvas]);
+
   useMotionValueEvent(frameIndex, "change", (latest) => {
-    if (!imagesLoaded) return;
-
+    if (!ready) return;
     const index = Math.round(latest);
     if (index !== currentFrame.current && index >= 1 && index <= TOTAL_FRAMES) {
       currentFrame.current = index;
@@ -112,35 +131,21 @@ export default function HeroSequence({ scrollContainerRef }) {
     }
   });
 
-  // Handle resize events to redraw
   useEffect(() => {
-    const handleResize = () => {
-      if (canvasRef.current) {
-        const rect = canvasRef.current.getBoundingClientRect();
-        canvasSize.current = { width: rect.width, height: rect.height };
-
-        const dpr = Math.min(window.devicePixelRatio || 1, 2);
-        canvasRef.current.width = rect.width * dpr;
-        canvasRef.current.height = rect.height * dpr;
-
-        const ctx = canvasRef.current.getContext("2d");
-        ctx.scale(dpr, dpr);
-
-        if (imagesLoaded) {
-          requestAnimationFrame(() => drawFrame(currentFrame.current));
-        }
-      }
+    const onResize = () => {
+      sizeCanvas();
+      requestAnimationFrame(() => drawFrame(currentFrame.current));
     };
-    window.addEventListener("resize", handleResize);
-    return () => window.removeEventListener("resize", handleResize);
-  }, [imagesLoaded]);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [drawFrame, sizeCanvas]);
 
   return (
     <canvas
       ref={canvasRef}
       className="hero-sequence-canvas"
       style={{
-        position: 'absolute',
+        position: "absolute",
         top: 0,
         left: 0,
         width: "100%",
